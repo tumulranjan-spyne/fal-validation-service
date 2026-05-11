@@ -148,7 +148,7 @@ class CarValidationApp(fal.App):
     image = ContainerImage.from_dockerfile("Dockerfile")
     keep_alive = 300
     min_concurrency = 1
-    max_concurrency = 8
+    max_concurrency = 1
     scaling_delay = 120
     # Many ONNX sessions + TorchScript on cold GPU; default 600s often kills mid-startup.
     startup_timeout = 3600

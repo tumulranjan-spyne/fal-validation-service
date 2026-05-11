@@ -18,12 +18,6 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 RUN python3 -m pip install --no-cache-dir --upgrade pip
 
 RUN pip install --no-cache-dir \
-    torch==2.8.0 torchvision==0.23.0 \
-    --index-url https://download.pytorch.org/whl/cu129
-
-RUN pip install --no-cache-dir \
-    onnxruntime-gpu==1.19.2 \
-    opencv-python-headless==4.10.0.84 \
     pillow==10.4.0 numpy==1.26.4 \
     fal==1.72.7 pydantic==2.10.6
 
