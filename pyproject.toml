@@ -1,0 +1,9 @@
+[project]
+name = "car-validation"
+version = "1.0.0"
+description = "Car validation service on fal.ai serverless GPU"
+requires-python = ">=3.11"
+
+[tool.fal.apps.car-validation]
+ref = "app.py::CarValidationApp"
+auth = "private"

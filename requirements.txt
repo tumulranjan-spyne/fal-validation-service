@@ -1,0 +1,10 @@
+# fal.ai car-validation service
+# Install: pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0
+torchvision==0.23.0
+onnxruntime-gpu==1.19.2
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+numpy==1.26.4
+fal==1.72.7
+pydantic==2.10.6
