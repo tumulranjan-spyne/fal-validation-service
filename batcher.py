@@ -31,7 +31,10 @@ class DynamicBatcher:
         """Submit a preprocessed array and block until result is ready."""
         result_queue: queue.Queue = queue.Queue()
         self._queue.put((input_array, result_queue))
-        return result_queue.get()
+        out = result_queue.get()
+        if isinstance(out, BaseException):
+            raise out
+        return out
 
     def _loop(self) -> None:
         batch: List[np.ndarray] = []
@@ -42,9 +45,17 @@ class DynamicBatcher:
             nonlocal batch, result_queues
             if not batch:
                 return
-            results = self._model_fn(batch)
-            for rq, out in zip(result_queues, results):
-                rq.put(out)
+            try:
+                results = self._model_fn(batch)
+                if len(results) != len(result_queues):
+                    raise RuntimeError(
+                        f"model returned {len(results)} outputs for batch of {len(result_queues)}"
+                    )
+                for rq, out in zip(result_queues, results):
+                    rq.put(out)
+            except BaseException as e:
+                for rq in result_queues:
+                    rq.put(e)
             batch.clear()
             result_queues.clear()
 

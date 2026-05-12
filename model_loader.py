@@ -141,18 +141,27 @@ class ONNXModel:
 # TorchScript Model
 # ============================================================================
 class TorchScriptModel:
-    def __init__(self, model_path: str):
+    def __init__(
+        self,
+        model_path: str,
+        input_dtype: Optional[torch.dtype] = None,
+    ):
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"Model not found: {model_path}")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = torch.jit.load(model_path, map_location=self.device).eval()
+        # Traced CLIP-style heads often bake matmul weights in float16 while activations
+        # default to float32 from numpy — matmul then raises float vs Half.
+        self.input_dtype = input_dtype
         print(f"[model] TorchScript {os.path.basename(model_path)} "
-              f"device={self.device}")
+              f"device={self.device} input_dtype={input_dtype!r}")
 
     def __call__(self, batch: List[np.ndarray]) -> List[np.ndarray]:
         stacked = np.stack(batch, axis=0)
         tensor = torch.from_numpy(stacked).to(self.device)
+        if self.input_dtype is not None:
+            tensor = tensor.to(self.input_dtype)
         with torch.no_grad():
             out = self.model(tensor)
         out_np = out.cpu().numpy()
@@ -176,58 +185,62 @@ def load_all_models() -> Dict[str, DynamicBatcher]:
     # --- ONNX models ---
     add("roi", lambda: ONNXModel(
         os.path.join(DATA_DIR, "auto-classification-roi", "1", "model.onnx"),
-        "input", "output"), max_batch=32, delay_ms=5)
+        "input", "output"), max_batch=64, delay_ms=5)
 
     add("davit", lambda: ONNXModel(
         os.path.join(DATA_DIR, "auto-classification-roi-davit", "1", "model.onnx"),
-        "INPUT__0", "OUTPUT__0"), max_batch=16, delay_ms=10)
+        "INPUT__0", "OUTPUT__0"), max_batch=32, delay_ms=10)
 
     add("angle", lambda: ONNXModel(
         os.path.join(DATA_DIR, "auto-classification-angle_classification", "1", "model.onnx"),
-        "input", "output"), max_batch=32, delay_ms=5)
+        "input", "output"), max_batch=64, delay_ms=5)
 
     add("cgi", lambda: ONNXModel(
         os.path.join(DATA_DIR, "cgi_classifier", "1", "model.onnx"),
-        "input", "output"), max_batch=8, delay_ms=10)
+        "input", "output"), max_batch=16, delay_ms=10)
 
     add("haze", lambda: ONNXModel(
         os.path.join(DATA_DIR, "haze_classifier", "1", "model.onnx"),
-        "input", "output"), max_batch=8, delay_ms=10)
+        "input", "output"), max_batch=16, delay_ms=10)
 
     # --- TorchScript models ---
     add("clip_backbone", lambda: TorchScriptModel(
         os.path.join(DATA_DIR, "clip_vit_B32", "1", "model.pt")),
-        max_batch=32, delay_ms=5)
+        max_batch=64, delay_ms=5)
 
     add("general_classifier", lambda: TorchScriptModel(
-        os.path.join(DATA_DIR, "general_classifier", "1", "model.pt")),
-        max_batch=32, delay_ms=5)
+        os.path.join(DATA_DIR, "general_classifier", "1", "model.pt"),
+        input_dtype=torch.float16,
+    ),
+        max_batch=64, delay_ms=5)
 
     add("car_type", lambda: TorchScriptModel(
-        os.path.join(DATA_DIR, "car_type_classifier_clip", "1", "model.pt")),
-        max_batch=32, delay_ms=5)
+        os.path.join(DATA_DIR, "car_type_classifier_clip", "1", "model.pt"),
+        input_dtype=torch.float16,
+    ),
+        max_batch=64, delay_ms=5)
 
     add("segmentation", lambda: TorchScriptModel(
         os.path.join(DATA_DIR, "auto-segmentation-exterior_removebg", "1", "model.pt")),
-        max_batch=4, delay_ms=20)
+        max_batch=8, delay_ms=20)
 
     add("focus", lambda: TorchScriptModel(
         os.path.join(DATA_DIR, "focus_classifier", "1", "model.pt")),
-        max_batch=4, delay_ms=10)
+        max_batch=8, delay_ms=10)
 
     add("resnet_v1", lambda: TorchScriptModel(
         os.path.join(DATA_DIR, "resnet_backbone_clf", "1", "model.pt")),
-        max_batch=8, delay_ms=10)
+        max_batch=16, delay_ms=10)
 
     add("resnet_v2", lambda: TorchScriptModel(
         os.path.join(DATA_DIR, "resnet_backbone_clf", "2", "model.pt")),
-        max_batch=8, delay_ms=10)
+        max_batch=16, delay_ms=10)
 
     # Optional: screen_classifier
     screen_path = os.path.join(DATA_DIR, "screen_classification", "1", "model.onnx")
     if os.path.isfile(screen_path):
         add("screen_classifier", lambda: ONNXModel(
-            screen_path, "input", "output"), max_batch=8, delay_ms=10)
+            screen_path, "input", "output"), max_batch=16, delay_ms=10)
     else:
         print("[model] screen_classification/1/model.onnx not found — screen_detect disabled")
 

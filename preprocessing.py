@@ -14,6 +14,8 @@ def preprocess_clip(image: np.ndarray, center_crop: bool = True) -> np.ndarray:
     """RGB uint8 -> [224,224,3] uint8 with aspect-preserving center crop."""
     if center_crop:
         h, w = image.shape[:2]
+        if h < 1 or w < 1:
+            return np.zeros((224, 224, 3), dtype=np.uint8)
         scale = 224 / min(h, w)
         new_h, new_w = int(h * scale), int(w * scale)
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)

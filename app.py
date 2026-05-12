@@ -16,7 +16,19 @@ from typing import Optional, Dict, Any, Tuple
 
 import fal
 from fal.container import ContainerImage
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
+
+# Decode helpers live here (not a separate module) so fal isolate unpickle never hits
+# ModuleNotFoundError for ``tensor_inputs`` when PYTHONPATH/cwd differs on workers.
+import io as _io
+
+
+def _ti_decode_npy_b64(b64: Optional[str]) -> Optional[Any]:
+    if b64 is None or not str(b64).strip():
+        return None
+    np, _, _ = _np_cv_pp()
+    raw = base64.standard_b64decode(str(b64).strip())
+    return np.load(_io.BytesIO(raw), allow_pickle=False)
 
 
 def _np_cv_pp():
@@ -54,10 +66,12 @@ CAR_ROI_DISPLAY = {
     "misc": "Miscellaneous", "focus": "Focus", "interior_360": "360int",
 }
 
+# Must match imagewizard CarAngleClassificationModel (auto-classification-angle_classification).
 ANGLE_LABELS = [
     0, 10, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190,
-    200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310,
-    320, 330, 340, 350, 40, 50, 60, 70, 80, 90,
+    20, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290,
+    30, 300, 310, 320, 330, 340, 350,
+    40, 50, 60, 70, 80, 90,
 ]
 
 GENERAL_LABELS = ['Human', 'Jewellery', 'Automobile', 'Footwear', 'Bag', 'Food', 'Food']
@@ -68,16 +82,45 @@ CAR_TYPE_LABELS = ["Hatchback", "SUV", "Sedan"]
 # Request / Response schemas
 # ============================================================================
 class CarValidationInput(BaseModel):
-    """POST body: flat JSON. image_url required; booleans default false.
+    """POST body: flat JSON.
 
-    422 Unprocessable Entity = schema mismatch; see HTTP response ``detail`` or
-    fal logs for which ``loc`` / ``msg`` failed (often missing image_url, wrong
-    types, or extra keys if client sends unsupported fields).
+    **Image (required):** ``image_url`` *or* ``image_rgb_uint8_npy_b64`` (uint8 HWC RGB ``.npy``).
+
+    **Optional per-model tensors** (base64 ``numpy.save`` each): skip matching preprocess,
+    pass directly to ``infer()`` — shapes match ``preprocessing.py`` / Triton inputs:
+
+    ``preprocessed_clip_vit_b32_224_uint8_npy_b64`` (224,224,3) uint8;
+    ``precomputed_clip_embedding_npy_b64`` (512,) float — skips clip for ``car_cls``;
+    ``preprocessed_roi_224_uint8_npy_b64``; ``preprocessed_davit_chw_fp32_npy_b64`` (3,512,512);
+    ``preprocessed_segmentation_bgr768_uint8_npy_b64`` BGR 768³;
+    ``precomputed_segmentation_mask_uint8_npy_b64`` (H,W) same as frame;
+    ``precomputed_tp_rgba_uint8_npy_b64`` (H,W,4) skips segmentation;
+    ``preprocessed_car_type_224_uint8_npy_b64``; ``preprocessed_angle_224_uint8_npy_b64``;
+    ``preprocessed_reflection_224_uint8_npy_b64``; ``preprocessed_tyre_mud_224_uint8_npy_b64``;
+    ``preprocessed_screen_224_uint8_npy_b64``; ``preprocessed_haze_224_uint8_npy_b64``;
+    ``preprocessed_cgi_224_uint8_npy_b64`` — all (224,224,3) uint8 unless noted.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    image_url: str
+    image_url: Optional[str] = None
+    image_rgb_uint8_npy_b64: Optional[str] = None
+
+    preprocessed_clip_vit_b32_224_uint8_npy_b64: Optional[str] = None
+    precomputed_clip_embedding_npy_b64: Optional[str] = None
+    preprocessed_roi_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_davit_chw_fp32_npy_b64: Optional[str] = None
+    preprocessed_segmentation_bgr768_uint8_npy_b64: Optional[str] = None
+    precomputed_segmentation_mask_uint8_npy_b64: Optional[str] = None
+    precomputed_tp_rgba_uint8_npy_b64: Optional[str] = None
+    preprocessed_car_type_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_angle_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_reflection_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_tyre_mud_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_screen_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_haze_224_uint8_npy_b64: Optional[str] = None
+    preprocessed_cgi_224_uint8_npy_b64: Optional[str] = None
+
     car_cls: bool = False
     car_shoot_category_cls: bool = False
     car_type_cls: bool = False
@@ -96,6 +139,22 @@ class CarValidationInput(BaseModel):
     haze_classification: bool = False
     check_cgi: bool = False
     additional_data: str = ""
+
+    @model_validator(mode="after")
+    def _exactly_one_image_source(self) -> "CarValidationInput":
+        has_url = bool(self.image_url and str(self.image_url).strip())
+        has_arr = bool(
+            self.image_rgb_uint8_npy_b64 and str(self.image_rgb_uint8_npy_b64).strip()
+        )
+        if has_url and has_arr:
+            raise ValueError(
+                "Provide either image_url or image_rgb_uint8_npy_b64, not both"
+            )
+        if not has_url and not has_arr:
+            raise ValueError(
+                "Provide image_url or image_rgb_uint8_npy_b64 (uint8 HWC RGB as npy base64)"
+            )
+        return self
 
 
 class CarValidationOutput(BaseModel):
@@ -144,15 +203,21 @@ class CarValidationApp(fal.App):
     # Isolate deserializes this module in a bare Python env (before requirements install).
     data_mounts = ["/data"]
 
-    machine_type = ["GPU-RTX5090"]
+    # Ordered fallback if 5090 capacity is tight (see fal-validation/deploy/USAGE.txt).
+    machine_type = ["GPU-RTX5090", "GPU-A6000", "GPU-A100"]
     image = ContainerImage.from_dockerfile("Dockerfile")
-    keep_alive = 300
+    # Single runner: min=max=1. Avoid repeated setup() by keeping this process hot long after
+    # the last request (see https://fal.ai/documentation/deployment/scale-your-application).
+    # New setup() only runs when fal starts a *new* runner (deploy, crash, host maintenance).
+    keep_alive = 3600  # seconds idle retention before scaling to zero
     min_concurrency = 1
     max_concurrency = 1
-    scaling_delay = 120
+    scaling_delay = 0  # was 120: with capacity at 0, do not wait 2min before starting a runner
     # Many ONNX sessions + TorchScript on cold GPU; default 600s often kills mid-startup.
     startup_timeout = 3600
     request_timeout = 3600
+    # Default max_multiplexing=1 ⇒ one request at a time on this GPU. Throughput for 10k+
+    # requests is ~ 10000 * latency; increase only if handlers are async-safe and VRAM allows.
 
     def setup(self) -> None:
         import model_loader as ml
@@ -195,7 +260,46 @@ class CarValidationApp(fal.App):
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Cannot decode image: {url[:120]}")
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return self._ensure_min_rgb_size(rgb, context=url[:120])
+
+    @staticmethod
+    def _decode_rgb_uint8_npy_b64(b64: str) -> Any:
+        import io
+
+        np, _, _ = _np_cv_pp()
+        raw = base64.standard_b64decode(b64.strip())
+        arr = np.load(io.BytesIO(raw), allow_pickle=False)
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(
+                f"image_rgb_uint8_npy_b64 must decode to uint8 HWC RGB; got {arr.shape} {arr.dtype}"
+            )
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _ensure_min_rgb_size(rgb: Any, *, context: str = "") -> Any:
+        """Match post-decode safeguards for URL path; ``rgb`` is HxWx3 uint8."""
+        np, cv2, _ = _np_cv_pp()
+        h, w = rgb.shape[:2]
+        if h < 1 or w < 1:
+            raise ValueError(f"Degenerate image size {w}x{h} {context}".strip())
+        min_side = min(h, w)
+        if min_side < 32:
+            scale = 32.0 / float(min_side)
+            rgb = cv2.resize(
+                rgb,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return rgb
+
+    def _rgb_from_payload(self, payload: CarValidationInput) -> Any:
+        if payload.image_rgb_uint8_npy_b64:
+            rgb = self._decode_rgb_uint8_npy_b64(payload.image_rgb_uint8_npy_b64)
+            return self._ensure_min_rgb_size(rgb, context="(npy)")
+        return self._download_rgb(payload.image_url)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Softmax helper
@@ -211,11 +315,17 @@ class CarValidationApp(fal.App):
     # ------------------------------------------------------------------
     # ROI classification (mirrors imagewizard classify_roi + classify_roi_2)
     # ------------------------------------------------------------------
-    def _classify_roi(self, img_rgb: Any) -> Tuple[str, Optional[str], float]:
+    def _classify_roi(self, img_rgb: Any, payload: CarValidationInput) -> Tuple[str, Optional[str], float]:
         """Returns (roi_label, subroi_label, confidence)."""
         np, _, pp = _np_cv_pp()
-        pre = pp.preprocess_roi(img_rgb)
-        logits = np.squeeze(self.models["roi"].infer(pre)).astype(np.float32)
+        t_roi = _ti_decode_npy_b64(payload.preprocessed_roi_224_uint8_npy_b64)
+        if t_roi is not None:
+            pre_roi = np.ascontiguousarray(t_roi.astype(np.uint8))
+            if pre_roi.shape != (224, 224, 3):
+                raise ValueError(f"preprocessed_roi must be (224,224,3) uint8; got {pre_roi.shape}")
+        else:
+            pre_roi = pp.preprocess_roi(img_rgb)
+        logits = np.squeeze(self.models["roi"].infer(pre_roi)).astype(np.float32)
         idx = int(np.argmax(logits))
         coarse = COARSE_ROI_LABELS[idx]
         conf = float(self._softmax(logits)[idx])
@@ -223,8 +333,17 @@ class CarValidationApp(fal.App):
         if coarse == "outer":
             return coarse, None, conf
 
-        # Davit fine-grained
-        davit_in = pp.preprocess_davit(img_rgb)[0]
+        t_dav = _ti_decode_npy_b64(payload.preprocessed_davit_chw_fp32_npy_b64)
+        if t_dav is not None:
+            davit_in = np.ascontiguousarray(t_dav.astype(np.float32))
+            if davit_in.ndim == 4 and davit_in.shape[0] == 1:
+                davit_in = davit_in[0]
+            if davit_in.shape != (3, 512, 512):
+                raise ValueError(
+                    f"preprocessed_davit must be (3,512,512) fp32; got {davit_in.shape}"
+                )
+        else:
+            davit_in = pp.preprocess_davit(img_rgb)[0]
         raw = np.squeeze(self.models["davit"].infer(davit_in)).astype(np.float32)
         if raw.ndim != 1:
             raw = raw.reshape(-1)
@@ -244,11 +363,29 @@ class CarValidationApp(fal.App):
     # ------------------------------------------------------------------
     # General classifier (CLIP backbone -> general_classifier head)
     # ------------------------------------------------------------------
-    def _general_classify(self, img_rgb: Any) -> Tuple[str, float]:
+    def _general_classify(self, img_rgb: Any, payload: CarValidationInput) -> Tuple[str, float]:
         np, _, pp = _np_cv_pp()
-        pre = pp.preprocess_clip(img_rgb, center_crop=True)
-        emb = self.models["clip_backbone"].infer(pre)
-        logits = np.squeeze(self.models["general_classifier"].infer(emb)).astype(np.float64)
+        t_emb = _ti_decode_npy_b64(payload.precomputed_clip_embedding_npy_b64)
+        if t_emb is not None:
+            emb = np.squeeze(t_emb).astype(np.float32)
+            if emb.size != 512:
+                emb = emb.reshape(-1)
+            if emb.shape[0] != 512:
+                raise ValueError(
+                    f"precomputed_clip_embedding must flatten to 512; got {t_emb.shape}"
+                )
+            emb_in = emb.astype(np.float32)
+        else:
+            t_clip = _ti_decode_npy_b64(payload.preprocessed_clip_vit_b32_224_uint8_npy_b64)
+            if t_clip is not None:
+                pre = np.ascontiguousarray(t_clip.astype(np.uint8))
+                if pre.shape != (224, 224, 3):
+                    raise ValueError(f"preprocessed_clip must be (224,224,3); got {pre.shape}")
+            else:
+                pre = pp.preprocess_clip(img_rgb, center_crop=True)
+            emb_out = self.models["clip_backbone"].infer(pre)
+            emb_in = np.squeeze(emb_out).astype(np.float32)
+        logits = np.squeeze(self.models["general_classifier"].infer(emb_in)).astype(np.float64)
         idx = int(np.argmax(logits))
         conf = float(self._softmax(logits)[idx]) * 100.0
         return GENERAL_LABELS[idx], conf
@@ -292,12 +429,12 @@ class CarValidationApp(fal.App):
 
         try:
             np, cv2, pp = _np_cv_pp()
-            img_rgb = self._download_rgb(payload.image_url)
+            img_rgb = self._rgb_from_payload(payload)
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
             # ---- Step 1: General classification ----
             if payload.car_cls:
-                cat, conf = self._general_classify(img_rgb)
+                cat, conf = self._general_classify(img_rgb, payload)
                 result["is_car"] = {
                     "value": cat == "Automobile",
                     "confidence": round(conf, 2),
@@ -312,7 +449,7 @@ class CarValidationApp(fal.App):
                 raw_roi = "interior_360"
                 roi_conf = 1.0
             else:
-                raw_roi, _, roi_conf = self._classify_roi(img_rgb)
+                raw_roi, _, roi_conf = self._classify_roi(img_rgb, payload)
 
             roi_display = CAR_ROI_DISPLAY.get(raw_roi, raw_roi)
 
@@ -327,14 +464,14 @@ class CarValidationApp(fal.App):
             # ---- Step 3: Interior / Focus sub-classification ----
             if payload.car_inter_interior_cls or payload.sub_cat_cls:
                 if roi_display == "Interior":
-                    _, sub_label, sub_conf = self._classify_roi(img_rgb)
+                    _, sub_label, sub_conf = self._classify_roi(img_rgb, payload)
                     result["interior_class"] = {
                         "value": sub_label,
                         "confidence": round(abs(sub_conf), 2),
                     }
                     result["sub_category"] = dict(result["interior_class"])
                 elif roi_display == "Focus":
-                    _, sub_label, sub_conf = self._classify_roi(img_rgb)
+                    _, sub_label, sub_conf = self._classify_roi(img_rgb, payload)
                     result["sub_category"] = {
                         "value": sub_label,
                         "confidence": round(abs(sub_conf), 2),
@@ -347,24 +484,70 @@ class CarValidationApp(fal.App):
                 result["sub_category"] = None
 
             # ---- Step 4: Exterior-only analyses ----
+            angle_val: Optional[int] = None
             if roi_display == "Exterior":
                 result["number_plate"] = None
 
-                # Segment car
-                seg_in = pp.preprocess_segmentation(img_bgr)
-                mask_arr = self.models["segmentation"].infer(seg_in[0])
-                mask = mask_arr.squeeze().astype(np.uint8)
-                if mask.shape != img_bgr.shape[:2]:
-                    mask = cv2.resize(mask, (img_bgr.shape[1], img_bgr.shape[0]),
-                                      interpolation=cv2.INTER_LINEAR)
-                mask = (mask > 128).astype(np.uint8) * 255
-                tp_rgba = np.dstack([img_rgb, mask])
+                # Segmentation / tp_rgba (optional client tensors skip compute)
+                t_tp = _ti_decode_npy_b64(payload.precomputed_tp_rgba_uint8_npy_b64)
+                t_msk = _ti_decode_npy_b64(payload.precomputed_segmentation_mask_uint8_npy_b64)
+                t_seg768 = _ti_decode_npy_b64(payload.preprocessed_segmentation_bgr768_uint8_npy_b64)
+
+                if t_tp is not None:
+                    tp_rgba = np.ascontiguousarray(t_tp.astype(np.uint8))
+                    if tp_rgba.ndim != 4 or tp_rgba.shape[2] != 4:
+                        raise ValueError(f"precomputed_tp_rgba must be HxWx4 uint8; got {tp_rgba.shape}")
+                    if tp_rgba.shape[0] != h_img or tp_rgba.shape[1] != w_img:
+                        raise ValueError(
+                            f"tp_rgba H×W {tp_rgba.shape[:2]} must match image {h_img}×{w_img}"
+                        )
+                    mask = tp_rgba[:, :, 3]
+                elif t_msk is not None:
+                    mask = np.ascontiguousarray(t_msk.astype(np.uint8))
+                    if mask.ndim != 2 or mask.shape != (h_img, w_img):
+                        raise ValueError(
+                            f"precomputed_segmentation_mask must be (H,W)=({h_img},{w_img}); got {mask.shape}"
+                        )
+                    tp_rgba = np.dstack([img_rgb, mask])
+                else:
+                    if t_seg768 is not None:
+                        b768 = np.ascontiguousarray(t_seg768.astype(np.uint8))
+                        if b768.shape != (768, 768, 3):
+                            raise ValueError(
+                                f"preprocessed_segmentation_bgr768 must be (768,768,3); got {b768.shape}"
+                            )
+                        seg_pixel = b768
+                    else:
+                        seg_pixel = pp.preprocess_segmentation(img_bgr)[0]
+                    mask_arr = self.models["segmentation"].infer(seg_pixel)
+                    mask = mask_arr.squeeze().astype(np.uint8)
+                    if mask.shape != img_bgr.shape[:2]:
+                        mask = cv2.resize(
+                            mask,
+                            (img_bgr.shape[1], img_bgr.shape[0]),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    mask = (mask > 128).astype(np.uint8) * 255
+                    tp_rgba = np.dstack([img_rgb, mask])
 
                 # Car type
                 if payload.car_type_cls:
-                    type_pre = pp.preprocess_car_type(img_rgb, mask)
+                    t_ct = _ti_decode_npy_b64(payload.preprocessed_car_type_224_uint8_npy_b64)
+                    if t_ct is not None:
+                        type_pre = np.ascontiguousarray(t_ct.astype(np.uint8))
+                        if type_pre.shape != (224, 224, 3):
+                            raise ValueError(f"preprocessed_car_type must be (224,224,3); got {type_pre.shape}")
+                    else:
+                        type_pre = pp.preprocess_car_type(img_rgb, mask)
                     type_logits = self.models["car_type"].infer(type_pre)
+                    type_logits = np.squeeze(type_logits).astype(np.float64)
+                    if type_logits.ndim != 1:
+                        type_logits = type_logits.reshape(-1)
                     type_idx = int(np.argmax(type_logits))
+                    if type_idx < 0 or type_idx >= len(CAR_TYPE_LABELS):
+                        raise ValueError(
+                            f"car_type model index {type_idx} out of range (n={len(type_logits)})"
+                        )
                     type_conf = float(self._softmax(type_logits)[type_idx]) * 100
                     result["car_type"] = {
                         "value": CAR_TYPE_LABELS[type_idx],
@@ -373,9 +556,22 @@ class CarValidationApp(fal.App):
 
                 # Angle
                 if payload.angle_detect:
-                    angle_pre = pp.preprocess_angle(tp_rgba)
+                    t_ang = _ti_decode_npy_b64(payload.preprocessed_angle_224_uint8_npy_b64)
+                    if t_ang is not None:
+                        angle_pre = np.ascontiguousarray(t_ang.astype(np.uint8))
+                        if angle_pre.shape != (224, 224, 3):
+                            raise ValueError(f"preprocessed_angle must be (224,224,3); got {angle_pre.shape}")
+                    else:
+                        angle_pre = pp.preprocess_angle(tp_rgba)
                     angle_logits = self.models["angle"].infer(angle_pre)
+                    angle_logits = np.squeeze(angle_logits).astype(np.float64)
+                    if angle_logits.ndim != 1:
+                        angle_logits = angle_logits.reshape(-1)
                     angle_idx = int(np.argmax(angle_logits))
+                    if angle_idx < 0 or angle_idx >= len(ANGLE_LABELS):
+                        raise ValueError(
+                            f"angle model index {angle_idx} out of range (n={len(angle_logits)})"
+                        )
                     angle_conf = float(self._softmax(angle_logits)[angle_idx]) * 100
                     angle_val = ANGLE_LABELS[angle_idx]
                     result["angle"] = {
@@ -423,7 +619,13 @@ class CarValidationApp(fal.App):
 
                 # Reflection
                 if payload.reflection_detect:
-                    refl_pre = pp.preprocess_reflection_tp(tp_rgba)
+                    t_rf = _ti_decode_npy_b64(payload.preprocessed_reflection_224_uint8_npy_b64)
+                    if t_rf is not None:
+                        refl_pre = np.ascontiguousarray(t_rf.astype(np.uint8))
+                        if refl_pre.shape != (224, 224, 3):
+                            raise ValueError(f"preprocessed_reflection must be (224,224,3); got {refl_pre.shape}")
+                    else:
+                        refl_pre = pp.preprocess_reflection_tp(tp_rgba)
                     refl_logits = self.models["resnet_v1"].infer(refl_pre)
                     refl_idx = int(np.argmax(refl_logits))
                     refl_conf = float(self._softmax(refl_logits)[refl_idx]) * 100
@@ -434,7 +636,13 @@ class CarValidationApp(fal.App):
 
                 # Tyre mud
                 if payload.tyre_mud_detect:
-                    mud_pre = pp.preprocess_224_pil(img_rgb)
+                    t_md = _ti_decode_npy_b64(payload.preprocessed_tyre_mud_224_uint8_npy_b64)
+                    if t_md is not None:
+                        mud_pre = np.ascontiguousarray(t_md.astype(np.uint8))
+                        if mud_pre.shape != (224, 224, 3):
+                            raise ValueError(f"preprocessed_tyre_mud must be (224,224,3); got {mud_pre.shape}")
+                    else:
+                        mud_pre = pp.preprocess_224_pil(img_rgb)
                     mud_logits = self.models["resnet_v2"].infer(mud_pre)
                     mud_idx = int(np.argmax(mud_logits))
                     mud_conf = float(self._softmax(mud_logits)[mud_idx]) * 100
@@ -450,7 +658,13 @@ class CarValidationApp(fal.App):
             # ---- Step 5: ROI-independent checks ----
             if payload.screen_detect:
                 if "screen_classifier" in self.models:
-                    screen_pre = pp.preprocess_224_pil(img_rgb)
+                    t_sc = _ti_decode_npy_b64(payload.preprocessed_screen_224_uint8_npy_b64)
+                    if t_sc is not None:
+                        screen_pre = np.ascontiguousarray(t_sc.astype(np.uint8))
+                        if screen_pre.shape != (224, 224, 3):
+                            raise ValueError(f"preprocessed_screen must be (224,224,3); got {screen_pre.shape}")
+                    else:
+                        screen_pre = pp.preprocess_224_pil(img_rgb)
                     screen_logits = self.models["screen_classifier"].infer(screen_pre)
                     screen_idx = int(np.argmax(screen_logits))
                     screen_conf = float(self._softmax(screen_logits)[screen_idx]) * 100
@@ -460,13 +674,25 @@ class CarValidationApp(fal.App):
                     }
 
             if payload.haze_classification:
-                haze_pre = pp.preprocess_haze(img_rgb)
+                t_hz = _ti_decode_npy_b64(payload.preprocessed_haze_224_uint8_npy_b64)
+                if t_hz is not None:
+                    haze_pre = np.ascontiguousarray(t_hz.astype(np.uint8))
+                    if haze_pre.shape != (224, 224, 3):
+                        raise ValueError(f"preprocessed_haze must be (224,224,3); got {haze_pre.shape}")
+                else:
+                    haze_pre = pp.preprocess_haze(img_rgb)
                 haze_logits = self.models["haze"].infer(haze_pre)
                 haze_idx = int(np.argmax(haze_logits))
                 result["is_haze"] = haze_idx != 0
 
             if payload.check_cgi:
-                cgi_pre = pp.preprocess_cgi(img_rgb)
+                t_cg = _ti_decode_npy_b64(payload.preprocessed_cgi_224_uint8_npy_b64)
+                if t_cg is not None:
+                    cgi_pre = np.ascontiguousarray(t_cg.astype(np.uint8))
+                    if cgi_pre.shape != (224, 224, 3):
+                        raise ValueError(f"preprocessed_cgi must be (224,224,3); got {cgi_pre.shape}")
+                else:
+                    cgi_pre = pp.preprocess_cgi(img_rgb)
                 cgi_logits = self.models["cgi"].infer(cgi_pre)
                 cgi_idx = int(np.argmax(cgi_logits))
                 cgi_conf = float(self._softmax(cgi_logits)[cgi_idx]) * 100
